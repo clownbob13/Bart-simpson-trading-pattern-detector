@@ -38,6 +38,3 @@ A detected pattern does not guarantee that price will move in a specific directi
 * Pine Script
 * TradingView
 
-## License
-
-See the `LICENSE` file for licensing information.
