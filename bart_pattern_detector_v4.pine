@@ -1,0 +1,546 @@
+//@version=5
+// Bart Simpson Pattern Detector v4 (adds early-watch state + developing-setup alerts)
+// (v3 base) (probabilistic pattern recognition, NOT trading advice)
+// Classic: sharp impulse -> flat plateau -> sharp reversal.
+// Extended: gradual rally/drop as the impulse, wider/choppier plateau, staircase reversal, target = base line.
+// Detection/confirmation use only bars up to the confirmed break bar (no look-ahead); evaluated on bar close.
+indicator("Bart Simpson Pattern Detector v4", shorttitle="Bart v4", overlay=true, max_boxes_count=300, max_lines_count=300, max_labels_count=300, max_polylines_count=100, max_bars_back=250)
+
+// ---------------- Inputs ----------------
+dirBoth = "Both"
+dirBear = "Bearish (up-impulse) only"
+dirBull = "Bullish (inverted) only"
+stClassic = "Classic (sharp)"
+stExt = "Extended (gradual / wide / staircase)"
+stBoth = "Both"
+gD = "Detection"
+styleSel  = input.string(stBoth, "Pattern style", options=[stClassic, stExt, stBoth], group=gD)
+presetSel = input.string("Balanced", "Sensitivity preset (scales the thresholds below)", options=["Strict", "Balanced", "Loose"], group=gD)
+simThr    = input.float(62, "Pattern similarity threshold (%)", minval=30, maxval=95, step=1, group=gD)
+minImp    = input.float(2.5, "Min impulse size (%)", minval=0.1, maxval=30, step=0.1, group=gD)
+atrK      = input.float(3.0, "Min impulse (ATR multiples)", minval=1, maxval=10, step=0.5, group=gD)
+maxImpB   = input.int(4, "Classic: max impulse duration (bars)", minval=1, maxval=6, group=gD)
+maxImpX   = input.int(10, "Extended: max impulse duration (bars)", minval=3, maxval=15, group=gD)
+minC      = input.int(5, "Min consolidation (bars)", minval=3, maxval=40, group=gD)
+maxC      = input.int(40, "Max consolidation (bars)", minval=8, maxval=80, group=gD)
+maxRange  = input.float(50, "Max consolidation range (% of impulse; Extended allows up to 75+)", minval=10, maxval=80, step=1, group=gD)
+maxVolat  = input.float(25, "Max consolidation volatility (% of impulse per bar; Extended allows 40+)", minval=3, maxval=40, step=1, group=gD)
+revReq    = input.float(70, "Required reversal (% of impulse)", minval=30, maxval=100, step=5, group=gD)
+rvWin     = input.int(6, "Classic: bars allowed for reversal", minval=2, maxval=20, group=gD)
+rvWinX    = input.int(15, "Extended: bars allowed for reversal (staircase)", minval=4, maxval=40, group=gD)
+useVol    = input.bool(true, "Require volume confirmation (if volume exists)", group=gD)
+dirSel    = input.string(dirBoth, "Direction", options=[dirBoth, dirBear, dirBull], group=gD)
+gT = "Trade simulation (for the stats table)"
+tgtOrigin = input.bool(false, "Target = impulse origin (base line) instead of required reversal %", group=gT)
+feeBps    = input.float(5, "Fees per side (bps)", minval=0, maxval=50, step=1, group=gT)
+holdBars  = input.int(40, "Max bars in trade", minval=5, maxval=200, group=gT)
+gV = "Display"
+showDev     = input.bool(true, "Show developing setup on latest bar", group=gV)
+showWatch   = input.bool(true, "Show early watch (impulse detected, watching for plateau)", group=gV)
+showOutline = input.bool(true, "Trace pattern outline", group=gV)
+showBase    = input.bool(true, "Draw base line (impulse origin)", group=gV)
+showStats   = input.bool(true, "Show live stats table", group=gV)
+showExits   = input.bool(true, "Mark simulated exits", group=gV)
+fwd         = input.int(25, "Bars to extend entry/target/invalidation", minval=5, maxval=100, group=gV)
+
+pS = presetSel == "Strict"
+pL = presetSel == "Loose"
+eSim   = pS ? math.max(simThr, 72.0) : pL ? simThr - 12 : simThr
+eMinImp = pS ? minImp * 1.5 : pL ? minImp * 0.6 : minImp
+eAtr   = pS ? atrK * 1.3 : pL ? atrK * 0.7 : atrK
+eRange = math.min(80.0, pS ? maxRange * 0.8 : pL ? maxRange * 1.2 : maxRange)
+eVolat = pS ? maxVolat * 0.8 : pL ? maxVolat * 1.3 : maxVolat
+
+// ---------------- Helpers ----------------
+cp(x) => math.max(0.0, math.min(1.0, x))
+pr(p0, p1, l) => p0 + l * (p1 - p0)
+
+resample(array<float> a, int m) =>
+    r = array.new_float(m)
+    n = array.size(a)
+    for i = 0 to m - 1
+        x = i * (n - 1) / float(m - 1)
+        j = int(math.floor(x))
+        f = x - j
+        array.set(r, i, array.get(a, j) * (1 - f) + array.get(a, math.min(j + 1, n - 1)) * f)
+    r
+
+atr14 = ta.atr(14)
+volOK = useVol and nz(ta.sma(volume, 50)) > 0
+enough = bar_index >= maxC + math.max(maxImpB, maxImpX) + 30
+
+// off = 1: plateau ended on the previous bar; current bar is the candidate break bar.
+// off = 0: plateau includes the current bar (developing setup).
+// Levels: 0 = impulse origin, 1 = impulse extreme. Classic is tried first; Extended only if Classic finds nothing.
+scan(int off, bool go) =>
+    float best = 0.0
+    bool bx = false
+    int bd = 0
+    int bke = 0
+    int bn = 0
+    int bL = 0
+    float bP0 = 0.0
+    float bP1 = 0.0
+    float bLo = 0.0
+    float bHi = 0.0
+    float bPct = 0.0
+    float bSim = 0.0
+    float bVr = na
+    if go
+        for m = 0 to 1
+            ext = m == 1
+            if (ext and styleSel == stClassic) or (not ext and styleSel == stExt) or (ext and best > 0)
+                continue
+            mImp = ext ? maxImpX : maxImpB
+            xRange = ext ? math.max(eRange, 75.0) : eRange
+            xVolat = ext ? math.max(eVolat, 40.0) : eVolat
+            xMl = ext ? 0.42 : 0.55
+            xSl = ext ? 0.4 : 0.3
+            tplL = ext ? 0.7 : 0.88
+            rDen = ext ? 0.5 : 0.35
+            vThr = ext ? 1.15 : 1.3
+            float phi = -1e18
+            float plo = 1e18
+            float sumR = 0.0
+            float sx = 0.0
+            float sy = 0.0
+            float sxy = 0.0
+            float sxx = 0.0
+            for L = 1 to maxC
+                po = off + L - 1
+                phi := math.max(phi, high[po])
+                plo := math.min(plo, low[po])
+                sumR += high[po] - low[po]
+                x = L - 1.0
+                sx += x
+                sy += close[po]
+                sxy += x * close[po]
+                sxx += x * x
+                if L >= minC
+                    ke = off + L
+                    for k = 0 to 1
+                        d = k == 0 ? 1 : -1
+                        if (d == 1 and dirSel == dirBull) or (d == -1 and dirSel == dirBear)
+                            continue
+                        float p0 = d > 0 ? 1e18 : -1e18
+                        float p1 = d > 0 ? -1e18 : 1e18
+                        float sImp = 0.0
+                        for n = 1 to mImp
+                            bo = ke + n - 1
+                            sImp += high[bo] - low[bo]
+                            if d > 0
+                                p0 := math.min(p0, low[bo])
+                                p1 := math.max(p1, high[bo])
+                            else
+                                p0 := math.max(p0, high[bo])
+                                p1 := math.min(p1, low[bo])
+                            H = math.abs(p1 - p0)
+                            if H <= 0
+                                continue
+                            pct = H / p0 * 100
+                            if pct < eMinImp
+                                continue
+                            f = 1.0 / (p1 - p0)
+                            if (close[ke] - p0) * f < 0.75 or (open[bo] - p0) * f > 0.3
+                                continue
+                            eff = sImp > 0 ? math.abs(close[ke] - open[bo]) / sImp : 0.0
+                            if ext and n >= 3 and eff < 0.4
+                                continue
+                            A = nz(atr14[bo + 1])
+                            if A <= 0 or H < eAtr * A
+                                continue
+                            hiL = d > 0 ? (phi - p0) * f : (plo - p0) * f
+                            loL = d > 0 ? (plo - p0) * f : (phi - p0) * f
+                            if hiL > 1.2 or loL < 1 - xRange / 100
+                                continue
+                            mr = sumR / H / L
+                            if mr > xVolat / 100
+                                continue
+                            den = L * sxx - sx * sx
+                            slope = den != 0 ? (L * sxy - sx * sy) / den : 0.0
+                            ml = (sy / L - p0) * f
+                            if math.abs(slope * f) * L > xSl or ml < xMl
+                                continue
+                            if off == 1 and (close - p0) * f >= loL - 0.02
+                                continue
+                            float vr = na
+                            float sV = na
+                            if volOK
+                                iv = 0.0
+                                for i = ke to bo
+                                    iv += volume[i]
+                                iv /= n
+                                bv = 0.0
+                                for i = bo + 1 to bo + 20
+                                    bv += volume[i]
+                                bv /= 20
+                                cv = 0.0
+                                for i = off to off + L - 1
+                                    cv += volume[i]
+                                cv /= L
+                                if bv <= 0 or iv / bv < vThr or cv >= iv
+                                    continue
+                                vr := iv / bv
+                                sV := (cp((iv / bv - 1) / 3) + cp((1 - cv / iv) / 0.5)) / 2
+                            imp = array.new_float()
+                            array.push(imp, (open[bo] - p0) * f)
+                            for i = bo to ke
+                                array.push(imp, (close[i] - p0) * f)
+                            pl = array.new_float()
+                            for i = off + L - 1 to off
+                                array.push(pl, (close[i] - p0) * f)
+                            a1 = resample(imp, 10)
+                            a2 = resample(pl, 30)
+                            se = 0.0
+                            for i = 0 to 9
+                                se += math.pow(array.get(a1, i) - i / 9.0, 2)
+                            for i = 0 to 29
+                                se += math.pow(array.get(a2, i) - tplL, 2)
+                            sim = math.max(0.0, 1 - math.sqrt(se / 40) / rDen)
+                            s1 = (cp(0.5 + (pct / eMinImp - 1) * 0.25) + cp(H / A / (eAtr * 3))) / 2
+                            s2 = 1 - (n - 1) / float(mImp) * 0.5
+                            if ext
+                                s2 := (s2 + cp(eff / 0.8)) / 2
+                            s3 = ((1 - cp((hiL - loL) / (xRange / 100)) * 0.8) + (1 - cp(mr / (xVolat / 100)) * 0.8)) / 2
+                            s4 = cp((ml - 0.4) / 0.5)
+                            s5 = cp(L / (1.5 * n + 2))
+                            wsum = 0.2 + 0.05 + 0.2 + 0.1 + 0.1 + 0.25
+                            tot = s1 * 0.2 + s2 * 0.05 + s3 * 0.2 + s4 * 0.1 + s5 * 0.1 + sim * 0.25
+                            if not na(sV)
+                                wsum += 0.1
+                                tot += sV * 0.1
+                            sc = tot / wsum
+                            if sc * 100 >= eSim and sc > best
+                                best := sc
+                                bx := ext
+                                bd := d
+                                bke := ke
+                                bn := n
+                                bL := L
+                                bP0 := p0
+                                bP1 := p1
+                                bLo := loL
+                                bHi := hiL
+                                bPct := pct
+                                bSim := sim
+                                bVr := vr
+    [best > 0, best, bd, bke, bn, bL, bP0, bP1, bLo, bHi, bPct, bSim, bVr, bx]
+
+// Early watch: a qualifying impulse has ended (or is ending on this bar) and the plateau has fewer than minC bars so far.
+// Uses only data up to the current bar. Picks the strongest candidate (largest move in ATRs).
+scanWatch(bool go) =>
+    float bestS = 0.0
+    int bd = 0
+    int bLp = 0
+    int bn = 0
+    float bP0 = 0.0
+    float bP1 = 0.0
+    float bPct = 0.0
+    float bVr = na
+    mImp = styleSel == stClassic ? maxImpB : maxImpX
+    xRange = styleSel == stClassic ? eRange : math.max(eRange, 75.0)
+    vThr = styleSel == stClassic ? 1.3 : 1.15
+    if go
+        for Lp = 0 to minC - 1
+            float phi = -1e18
+            float plo = 1e18
+            if Lp > 0
+                for j = 0 to Lp - 1
+                    phi := math.max(phi, high[j])
+                    plo := math.min(plo, low[j])
+            for k = 0 to 1
+                d = k == 0 ? 1 : -1
+                if (d == 1 and dirSel == dirBull) or (d == -1 and dirSel == dirBear)
+                    continue
+                float p0 = d > 0 ? 1e18 : -1e18
+                float p1 = d > 0 ? -1e18 : 1e18
+                float sImp = 0.0
+                for n = 1 to mImp
+                    bo = Lp + n - 1
+                    sImp += high[bo] - low[bo]
+                    if d > 0
+                        p0 := math.min(p0, low[bo])
+                        p1 := math.max(p1, high[bo])
+                    else
+                        p0 := math.max(p0, high[bo])
+                        p1 := math.min(p1, low[bo])
+                    H = math.abs(p1 - p0)
+                    if H <= 0
+                        continue
+                    pct = H / p0 * 100
+                    if pct < eMinImp
+                        continue
+                    f = 1.0 / (p1 - p0)
+                    if (close[Lp] - p0) * f < 0.75 or (open[bo] - p0) * f > 0.3
+                        continue
+                    eff = sImp > 0 ? math.abs(close[Lp] - open[bo]) / sImp : 0.0
+                    if n >= 3 and eff < 0.4
+                        continue
+                    A = nz(atr14[bo + 1])
+                    if A <= 0 or H < eAtr * A
+                        continue
+                    if Lp > 0
+                        hiL = d > 0 ? (phi - p0) * f : (plo - p0) * f
+                        loL = d > 0 ? (plo - p0) * f : (phi - p0) * f
+                        if hiL > 1.2 or loL < 1 - xRange / 100
+                            continue
+                    if (close - p0) * f < 0.5
+                        continue
+                    float vr = na
+                    if volOK
+                        iv = 0.0
+                        for i = Lp to bo
+                            iv += volume[i]
+                        iv /= n
+                        bv = 0.0
+                        for i = bo + 1 to bo + 20
+                            bv += volume[i]
+                        bv /= 20
+                        if bv <= 0 or iv / bv < vThr
+                            continue
+                        vr := iv / bv
+                    strength = H / A
+                    if strength > bestS
+                        bestS := strength
+                        bd := d
+                        bLp := Lp
+                        bn := n
+                        bP0 := p0
+                        bP1 := p1
+                        bPct := pct
+                        bVr := vr
+    [bestS > 0, bd, bLp, bn, bP0, bP1, bPct, bVr]
+
+mkText(bool bear, float sc, float retr, int st, bool ext) =>
+    conf = st == 1 ? 0.85 * sc + 0.15 * math.min(1.0, retr) : sc
+    head = st == 1 ? "Pattern detected — confirmation needed" : st == 2 ? "Setup — reversal incomplete" : "Possible setup — reversal in progress"
+    head + (ext ? " [extended]" : "") + "\nPotential " + (bear ? "bearish" : "bullish") + " setup\nConfidence " + str.tostring(math.round(conf * 100)) + "%"
+
+// ---------------- State ----------------
+var int lastEnd = -1
+var label aLbl = na
+var bool aAct = false
+var bool aDone = false
+var bool aExt = false
+var int aWin = 6
+var int aBar = 0
+var int aDir = 0
+var float aP0 = na
+var float aP1 = na
+var float aLo = na
+var float aHi = na
+var float aSc = na
+var float aMin = na
+var bool pend = false
+var bool tAct = false
+var int tDir = 0
+var int tEntryBar = 0
+var float tP0 = na
+var float tP1 = na
+var float tStopL = na
+var float tTgtL = na
+var float tEntry = na
+var int nSig = 0
+var int nTr = 0
+var int nTgt = 0
+var int nStop = 0
+var int nTO = 0
+var int nWin = 0
+var int sumBars = 0
+var float sumRet = 0.0
+var float eq = 1.0
+var float pk = 1.0
+var float mdd = 0.0
+bool doneNow = false
+
+[ok, sc, d, ke, nI, L, P0, P1, lo, hi, pct, sim, vr, xt] = scan(1, enough and barstate.isconfirmed)
+bool newSig = ok and (bar_index - ke - nI + 1) > lastEnd and barstate.isconfirmed
+bool bearSig = newSig and d > 0
+bool bullSig = newSig and d < 0
+
+// ---------------- Reversal progress (bars after the break only) ----------------
+if aAct and barstate.isconfirmed and bar_index > aBar
+    bl = ((aDir > 0 ? low : high) - aP0) / (aP1 - aP0)
+    aMin := math.min(aMin, bl)
+    if not aDone and 1 - aMin >= revReq / 100
+        aDone := true
+        doneNow := true
+        label.set_text(aLbl, mkText(aDir > 0, aSc, 1 - aMin, 1, aExt))
+        box.new(aBar, pr(aP0, aP1, aLo), bar_index, aP0, border_color=color.new(aDir > 0 ? color.red : color.green, 40), bgcolor=color.new(aDir > 0 ? color.red : color.green, 88))
+    if bar_index >= aBar + aWin
+        if not aDone
+            label.set_text(aLbl, mkText(aDir > 0, aSc, 1 - aMin, 2, aExt))
+            label.set_color(aLbl, color.gray)
+        aAct := false
+
+// ---------------- Simulated trade ----------------
+if barstate.isconfirmed
+    if pend and bar_index == aBar + 1
+        pend := false
+        tgtL = tgtOrigin ? 0.03 : 1 - revReq / 100
+        stopL = aHi + 0.05
+        el = (open - aP0) / (aP1 - aP0)
+        if not tAct and el < stopL and el > tgtL
+            tAct := true
+            tDir := aDir
+            tP0 := aP0
+            tP1 := aP1
+            tStopL := stopL
+            tTgtL := tgtL
+            tEntry := open
+            tEntryBar := bar_index
+            nTr += 1
+    if tAct
+        topL = tDir > 0 ? (high - tP0) / (tP1 - tP0) : (low - tP0) / (tP1 - tP0)
+        botL = tDir > 0 ? (low - tP0) / (tP1 - tP0) : (high - tP0) / (tP1 - tP0)
+        float ex = na
+        int res = 0
+        if topL >= tStopL
+            ex := pr(tP0, tP1, tStopL)
+            res := -1
+            nStop += 1
+        else if botL <= tTgtL
+            ex := pr(tP0, tP1, tTgtL)
+            res := 1
+            nTgt += 1
+        else if bar_index - tEntryBar >= holdBars
+            ex := close
+            nTO += 1
+        if not na(ex)
+            ret = (tDir > 0 ? -1 : 1) * (ex - tEntry) / tEntry - 2 * feeBps / 1e4
+            sumRet += ret
+            sumBars += bar_index - tEntryBar
+            if ret > 0
+                nWin += 1
+            eq *= 1 + ret
+            pk := math.max(pk, eq)
+            mdd := math.max(mdd, (pk - eq) / pk)
+            tAct := false
+            if showExits
+                label.new(bar_index, ex, "", style=label.style_diamond, size=size.tiny, color=res == 1 ? color.green : res == -1 ? color.red : color.gray, tooltip=(res == 1 ? "Simulated exit: target" : res == -1 ? "Simulated exit: invalidation" : "Simulated exit: time limit") + " (" + str.tostring(ret * 100, "#.00") + "% after fees)")
+
+// ---------------- New confirmed signal ----------------
+if newSig
+    aWin := xt ? rvWinX : rvWin
+    lastEnd := bar_index + aWin
+    nSig += 1
+    bear = d > 0
+    col = bear ? color.red : color.green
+    tl = tgtOrigin ? 0.03 : 1 - revReq / 100
+    box.new(bar_index - ke - nI + 1, math.max(P0, P1), bar_index - ke, math.min(P0, P1), border_color=color.new(color.blue, 30), bgcolor=color.new(color.blue, 88))
+    box.new(bar_index - L, pr(P0, P1, hi), bar_index - 1, pr(P0, P1, lo), border_color=color.orange, bgcolor=color.new(color.orange, 85))
+    box.new(bar_index, pr(P0, P1, lo), bar_index + fwd, pr(P0, P1, lo - 0.06), border_color=na, bgcolor=color.new(color.blue, 75), text="Entry zone", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    box.new(bar_index, pr(P0, P1, tl), bar_index + fwd, pr(P0, P1, tl + 0.1), border_color=na, bgcolor=color.new(color.green, 75), text="Target zone", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    line.new(bar_index - L, pr(P0, P1, hi + 0.05), bar_index + fwd, pr(P0, P1, hi + 0.05), color=color.red, style=line.style_dashed)
+    if showBase
+        line.new(bar_index - ke - nI + 1, P0, bar_index + fwd, P0, color=color.blue, width=1)
+    if showOutline
+        pts = array.new<chart.point>()
+        array.push(pts, chart.point.from_index(bar_index - ke - nI + 1, open[ke + nI - 1]))
+        for i = ke + nI - 1 to ke
+            array.push(pts, chart.point.from_index(bar_index - i, close[i]))
+        for i = L to 1
+            array.push(pts, chart.point.from_index(bar_index - i, close[i]))
+        array.push(pts, chart.point.from_index(bar_index, close))
+        polyline.new(pts, line_color=col, line_width=2)
+    tip = (xt ? "Style: Extended\n" : "Style: Classic\n") + "Impulse " + str.tostring(pct, "#.0") + "% in " + str.tostring(nI) + " bar(s)\nPlateau " + str.tostring(L) + " bars, range " + str.tostring((hi - lo) * 100, "#") + "% of impulse\nShape similarity " + str.tostring(sim * 100, "#") + "%\n" + (na(vr) ? "Volume not used" : "Impulse volume " + str.tostring(vr, "#.0") + "x prior average") + "\nEntry zone " + str.tostring(pr(P0, P1, lo), format.mintick) + " - " + str.tostring(pr(P0, P1, lo - 0.06), format.mintick) + "\nTarget zone " + str.tostring(pr(P0, P1, tl), format.mintick) + " - " + str.tostring(pr(P0, P1, tl + 0.1), format.mintick) + "\nInvalidation " + str.tostring(pr(P0, P1, hi + 0.05), format.mintick) + "\nProbabilistic match, not a prediction."
+    aLbl := label.new(bar_index - int(L / 2), pr(P0, P1, hi), mkText(bear, sc, 0.0, 0, xt), style=bear ? label.style_label_down : label.style_label_up, color=color.new(col, 20), textcolor=color.white, size=size.small, tooltip=tip)
+    aAct := true
+    aDone := false
+    aExt := xt
+    pend := true
+    aBar := bar_index
+    aDir := d
+    aP0 := P0
+    aP1 := P1
+    aLo := lo
+    aHi := hi
+    aSc := sc
+    aMin := ((bear ? low : high) - P0) / (P1 - P0)
+    if 1 - aMin >= revReq / 100
+        aDone := true
+        doneNow := true
+        label.set_text(aLbl, mkText(bear, sc, 1 - aMin, 1, xt))
+
+// ---------------- Developing setup (latest bar only) ----------------
+var box dB1 = na
+var box dB2 = na
+var label dLb = na
+var line dTr = na
+var line dIn = na
+var line dTg = na
+[dok, dsc, dd, dke, dn, dL, dP0, dP1, dlo, dhi, dpct, dsim, dvr, dxt] = scan(0, barstate.islast and enough)
+if barstate.islast
+    box.delete(dB1)
+    box.delete(dB2)
+    label.delete(dLb)
+    line.delete(dTr)
+    line.delete(dIn)
+    line.delete(dTg)
+    if showDev and dok and (bar_index - dke - dn + 1) > lastEnd
+        dbear = dd > 0
+        dtl = tgtOrigin ? 0.03 : 1 - revReq / 100
+        dB1 := box.new(bar_index - dke - dn + 1, math.max(dP0, dP1), bar_index - dke, math.min(dP0, dP1), border_color=color.blue, border_style=line.style_dashed, bgcolor=color.new(color.blue, 90))
+        dB2 := box.new(bar_index - dL + 1, pr(dP0, dP1, dhi), bar_index, pr(dP0, dP1, dlo), border_color=color.orange, border_style=line.style_dashed, bgcolor=color.new(color.orange, 90))
+        dTr := line.new(bar_index - dL + 1, pr(dP0, dP1, dlo), bar_index + fwd, pr(dP0, dP1, dlo), color=color.blue, style=line.style_dotted)
+        dIn := line.new(bar_index - dL + 1, pr(dP0, dP1, dhi + 0.05), bar_index + fwd, pr(dP0, dP1, dhi + 0.05), color=color.red, style=line.style_dashed)
+        dTg := line.new(bar_index, pr(dP0, dP1, dtl), bar_index + fwd, pr(dP0, dP1, dtl), color=color.green, style=line.style_dashed)
+        dLb := label.new(bar_index - int(dL / 2), pr(dP0, dP1, dhi), "Possible setup developing — awaiting break" + (dxt ? " [extended]" : "") + "\nPotential " + (dbear ? "bearish" : "bullish") + " setup\nSimilarity " + str.tostring(math.round(dsc * 100)) + "%", style=dbear ? label.style_label_down : label.style_label_up, color=color.new(color.blue, 20), textcolor=color.white, size=size.small, tooltip="Trigger (blue dotted): a close through the plateau edge confirms the break.\nInvalidation (red dashed): beyond the plateau extreme.\nTarget (green dashed): per your target setting.")
+
+// ---------------- Early watch + fresh-setup alert flags (alerts fire on bar close only) ----------------
+var box wB = na
+var line wInv = na
+var line wExt = na
+var label wLb = na
+var int lastWatchBar = -1000
+var int lastDevEnd = -1
+bool devAlert = false
+bool watchAlert = false
+[wok, wd, wLp, wn, wP0, wP1, wpct, wvr] = scanWatch(barstate.islast and enough)
+bool devFresh = dok and barstate.isconfirmed and barstate.islast and (bar_index - dke - dn + 1) > lastEnd and (bar_index - dke) != lastDevEnd
+if devFresh
+    devAlert := true
+    lastDevEnd := bar_index - dke
+bool watchOn = wok and not dok and not aAct and (bar_index - wLp - wn + 1) > lastEnd
+bool watchFresh = watchOn and barstate.isconfirmed and barstate.islast and bar_index - lastWatchBar > maxImpX + minC
+if watchFresh
+    watchAlert := true
+    lastWatchBar := bar_index
+if barstate.islast
+    box.delete(wB)
+    line.delete(wInv)
+    line.delete(wExt)
+    label.delete(wLb)
+    if showWatch and watchOn
+        wbear = wd > 0
+        wB := box.new(bar_index - wLp - wn + 1, math.max(wP0, wP1), bar_index - wLp, math.min(wP0, wP1), border_color=color.blue, border_style=line.style_dashed, bgcolor=color.new(color.blue, 92))
+        wExt := line.new(bar_index - wLp, wP1, bar_index + fwd, wP1, color=color.orange, style=line.style_dotted)
+        wInv := line.new(bar_index - wLp, pr(wP0, wP1, 1.2), bar_index + fwd, pr(wP0, wP1, 1.2), color=color.red, style=line.style_dashed)
+        wLb := label.new(bar_index - wLp, wP1, "Early watch — impulse detected\nWatching for a plateau (" + str.tostring(wLp) + "/" + str.tostring(minC) + " bars so far)\nIf it forms: potential " + (wbear ? "bearish" : "bullish") + " setup", style=wbear ? label.style_label_down : label.style_label_up, color=color.new(color.gray, 20), textcolor=color.white, size=size.small, tooltip="Impulse " + str.tostring(wpct, "#.0") + "% in " + str.tostring(wn) + " bar(s)" + (na(wvr) ? "" : ", volume " + str.tostring(wvr, "#.0") + "x prior average") + ".\nCancelled if price keeps extending past the red dashed line, or if no plateau forms.\nNot a signal: many sharp moves never form the pattern.")
+
+// ---------------- Stats table + disclaimer ----------------
+var table st = table.new(position.top_right, 2, 9, bgcolor=color.new(color.black, 35), border_width=1, border_color=color.new(color.gray, 60))
+var table tb = table.new(position.bottom_right, 1, 1)
+setRow(int r, string k, string v) =>
+    table.cell(st, 0, r, k, text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(st, 1, r, v, text_color=color.white, text_size=size.small, text_halign=text.align_right)
+if barstate.islast
+    table.cell(tb, 0, 0, "Bart detector: probabilistic pattern match. Not a prediction, not advice.", text_color=color.gray, text_size=size.tiny)
+    if showStats
+        closedN = nTgt + nStop + nTO
+        setRow(0, "Bart stats (loaded bars)", "")
+        setRow(1, "Confirmed signals", str.tostring(nSig))
+        setRow(2, "Simulated trades", str.tostring(nTr))
+        setRow(3, "Reached target", str.tostring(nTgt))
+        setRow(4, "Reached invalidation", str.tostring(nStop))
+        setRow(5, "Win / loss", closedN > 0 ? str.tostring(nWin) + " / " + str.tostring(closedN - nWin) : "-")
+        setRow(6, "Avg return (after fees)", closedN > 0 ? str.tostring(sumRet / closedN * 100, "#.00") + "%" : "-")
+        setRow(7, "Max drawdown", closedN > 0 ? str.tostring(mdd * 100, "#.0") + "%" : "-")
+        setRow(8, "Avg bars in trade", closedN > 0 ? str.tostring(sumBars / float(closedN), "#.0") : "-")
+
+// ---------------- Alerts (fire on bar close) ----------------
+alertcondition(bearSig, "Bearish Bart setup: break confirmed", "Potential bearish Bart setup: break confirmed on {{ticker}} ({{interval}}). Pattern recognition is probabilistic.")
+alertcondition(bullSig, "Bullish Bart setup: break confirmed", "Potential bullish (inverted) Bart setup: break confirmed on {{ticker}} ({{interval}}). Pattern recognition is probabilistic.")
+alertcondition(watchAlert, "Bart early watch: impulse detected", "Possible Bart impulse on {{ticker}} ({{interval}}): watching for a plateau. Early heads-up only; most sharp moves do not complete the pattern.")
+alertcondition(devAlert, "Bart setup developing: plateau formed", "Possible Bart setup developing on {{ticker}} ({{interval}}): impulse plus plateau, awaiting a break. Probabilistic, not a prediction.")
+alertcondition(doneNow, "Bart pattern complete", "Bart pattern reversal reached the required size on {{ticker}} ({{interval}}).")
